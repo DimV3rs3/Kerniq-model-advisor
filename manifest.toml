@@ -1,0 +1,13 @@
+plugin_id = "model-advisor"
+name = "Model advisor"
+version = "0.1.1"
+api_version = "1.0"
+manifest_version = "1.0"
+entry_point = "main.PluginImpl"
+description = "Compares a local model's quantization, parameter count, and context window with this machine. Nothing leaves the computer."
+capabilities = ["tools"]
+author = "Kerniq"
+license = "MIT"
+
+[tools]
+expose_to_agent = true
