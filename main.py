@@ -42,7 +42,7 @@ class PluginImpl(Plugin):
         self._manifest = PluginManifest(
             plugin_id="model-advisor",
             name="Model advisor",
-            version="0.1.1",
+            version="0.1.2",
             api_version="1.0",
             manifest_version="1.0",
             entry_point="main.PluginImpl",

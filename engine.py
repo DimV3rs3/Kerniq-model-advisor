@@ -70,14 +70,26 @@ def kv_gb(params_b: float, context: int) -> float:
 
 
 def _budget(system: dict, preset: str) -> tuple[str, float]:
+    """GPU memory when a GPU is measured. Otherwise total RAM minus a reserve.
+
+    Free RAM is the wrong budget. A machine with 64 GB installed and 16 GB
+    free can still hold a large model: the rest is cache, not a hard limit.
+    """
     vram = system.get("vram_total_gb")
-    ram = system.get("memory_available_gb") or system.get("memory_total_gb")
+    total = system.get("memory_total_gb")
+    available = system.get("memory_available_gb")
     share = {"performance": 0.72, "balance": 0.80, "context": 0.88}[preset]
-    ram_share = {"performance": 0.45, "balance": 0.55, "context": 0.62}[preset]
-    if isinstance(vram, (int, float)) and vram > 0:
+    if isinstance(vram, (int, float)) and float(vram) > 0:
         return "vram", round(float(vram) * share, 2)
-    if isinstance(ram, (int, float)) and ram > 0:
-        return "ram", round(float(ram) * ram_share, 2)
+    ram = None
+    if isinstance(total, (int, float)) and float(total) > 0:
+        reserve = min(max(2.0, float(total) * 0.12), 8.0)
+        ram = max(1.0, float(total) - reserve)
+    elif isinstance(available, (int, float)) and float(available) > 0:
+        ram = float(available)
+    if ram:
+        ram_share = {"performance": 0.70, "balance": 0.82, "context": 0.90}[preset]
+        return "ram", round(ram * ram_share, 2)
     return "unknown", 4.0
 
 
@@ -141,6 +153,8 @@ def _shape(system: dict, preset: str) -> dict[str, Any]:
 
 
 def _score(row: dict, preset: str) -> float:
+    if not row.get("known_size", True):
+        return -1000.0
     if not row["fits"]:
         return -100.0 - row["used_gb"]
     if preset == "performance":
@@ -149,6 +163,74 @@ def _score(row: dict, preset: str) -> float:
         return row["context"] / 1000.0 - row["weight_gb"] + (5.0 if row["where"] == "vram" else 0.0)
     target = row["used_gb"] / row["budget_gb"] if row["budget_gb"] else 1
     return 40.0 - abs(target - 0.7) * 30.0 + (6.0 if row["where"] == "vram" else 0.0)
+
+
+def _unsized(name: str, system: dict, preset: str) -> dict[str, Any]:
+    where, budget = _budget(system, preset)
+    return {
+        "model": name,
+        "params_b": None,
+        "quant": None,
+        "context": None,
+        "weight_gb": None,
+        "kv_gb": None,
+        "used_gb": None,
+        "budget_gb": budget,
+        "where": where,
+        "fits": False,
+        "known_size": False,
+        "score": -1000.0,
+        "note": "Parameter count was not in the name. This model was not given a size.",
+    }
+
+
+def _place(where: str) -> str:
+    return {
+        "vram": "GPU memory",
+        "ram": "system RAM",
+        "unknown": "an unknown memory size, so this is only a starting point",
+    }.get(where, where)
+
+
+def _fit_sentence(row: dict) -> str:
+    place = _place(row.get("where") or "")
+    return (
+        f"about {row['params_b']:g}B {row['quant']} at {row['context']} tokens. "
+        f"Weights {row['weight_gb']} GB, KV cache about {row['kv_gb']} GB, "
+        f"{row['used_gb']} GB of {row['budget_gb']} GB {place}."
+    )
+
+
+def _summarize(system: dict, preset: str, recommendation: dict, candidates: list, shape: dict) -> str:
+    total = system.get("memory_total_gb")
+    if isinstance(total, (int, float)):
+        ram = f"{float(total):.2f} GB RAM"
+    else:
+        ram = "an unknown amount of RAM"
+    lines = [
+        f"This computer has {ram}.",
+        f"A {preset} fit on this machine is {_fit_sentence(shape)}",
+    ]
+    named = [row for row in candidates if row.get("model")]
+    known = [row for row in named if row.get("known_size")]
+    unsized = [row for row in named if not row.get("known_size")]
+    if named:
+        lines.append(f"{len(named)} local model(s) were listed.")
+    if known:
+        lines.append(f"{len(known)} include a parameter count.")
+    if recommendation.get("model") and recommendation.get("known_size"):
+        fit = "It fits." if recommendation.get("fits") else "It does not fit. A smaller parameter count is safer."
+        lines.append(
+            f"Best installed match: {recommendation['model']}, "
+            f"{recommendation['params_b']:g}B {recommendation['quant']} at {recommendation['context']} tokens. {fit}"
+        )
+    elif named:
+        lines.append("No installed model with a known size was recommended. The fit above is what this computer can hold, not one of those models.")
+    if unsized:
+        lines.append(
+            f"{len(unsized)} name(s) do not include a parameter count, so they were not given a size and were not recommended."
+        )
+    return " ".join(lines)
 
 
 def advise(
@@ -172,31 +254,36 @@ def advise(
     names = list(models or [])
     if model:
         names.insert(0, model)
-    if names:
-        for name in names:
-            parsed = parse_model(name, params_b=params_b, quant=quant, context=context)
-            if parsed["params_b"] is None:
-                parsed["note"] = (parsed["note"] + " " if parsed["note"] else "") + "Parameter count was not in the name, so the fit is only a shape for this machine."
-                parsed["params_b"] = _shape(system, chosen)["params_b"]
-            if not parsed["quant"]:
-                parsed["quant"] = {"performance": "Q4_K_M", "balance": "Q5_K_M", "context": "Q4_K_M"}[chosen]
-            row = _fit(parsed, system, chosen)
-            row["score"] = round(_score(row, chosen), 2)
-            candidates.append(row)
-        recommendation = max(candidates, key=lambda row: row["score"])
+    shape = _shape(system, chosen)
+    shape["known_size"] = True
+    shape["score"] = round(_score(shape, chosen), 2)
+    solo = len(names) == 1
+    for name in names:
+        parsed = parse_model(
+            str(name),
+            params_b=params_b if solo else None,
+            quant=quant if solo else None,
+            context=context if solo else None,
+        )
+        if parsed.get("params_b") is None:
+            candidates.append(_unsized(str(name), system, chosen))
+            continue
+        if not parsed.get("quant"):
+            parsed["quant"] = {"performance": "Q4_K_M", "balance": "Q5_K_M", "context": "Q4_K_M"}[chosen]
+        row = _fit(parsed, system, chosen)
+        row["known_size"] = True
+        row["score"] = round(_score(row, chosen), 2)
+        candidates.append(row)
+    known = [row for row in candidates if row.get("known_size")]
+    if known:
+        recommendation = max(known, key=lambda row: row["score"])
+    elif names:
+        recommendation = dict(shape)
+        recommendation["model"] = ""
     else:
-        recommendation = _shape(system, chosen)
-        recommendation["score"] = round(_score(recommendation, chosen), 2)
-        candidates = [recommendation]
-    where = recommendation["where"]
-    place = {"vram": "GPU memory", "ram": "system RAM", "unknown": "an unknown memory size, so this is only a starting point"}.get(where, where)
-    summary = (
-        f"{chosen}: about {recommendation['params_b']:g}B {recommendation['quant']} "
-        f"at {recommendation['context']} tokens. Weights {recommendation['weight_gb']} GB, "
-        f"KV cache about {recommendation['kv_gb']} GB, {recommendation['used_gb']} GB against {recommendation['budget_gb']} GB of {place}."
-    )
-    if not recommendation["fits"]:
-        summary += " It does not fit. Use a smaller parameter count, a lower quant, or a shorter context."
+        recommendation = shape
+        candidates = []
+    summary = _summarize(system, chosen, recommendation, candidates, shape)
     return {
         "preset": chosen,
         "local_only": True,
@@ -267,11 +354,7 @@ def _describe(item: object) -> tuple[str, float | None, str | None, int | None]:
 
 
 def survey(models, preset: str = "balance", *, system: dict | None = None) -> dict[str, Any]:
-    """Fit each provider model on its own parameter count, quant, and context.
-
-    ``advise`` applies one parameter count to every name. A model list from
-    Kerniq does not work that way: each row carries its own numbers.
-    """
+    """Fit each listed model on its own parameter count. Unknown sizes are not guessed."""
     chosen = (preset or "").strip().lower()
     if chosen not in _PRESETS:
         raise ValueError("preset must be balance, performance, or context.")
@@ -292,29 +375,25 @@ def survey(models, preset: str = "balance", *, system: dict | None = None) -> di
             "quant": parsed.get("quant"),
             "context": parsed.get("context"),
         })
-        if parsed["params_b"] is None:
-            parsed["note"] = (parsed["note"] + " " if parsed["note"] else "") + "Parameter count was not in the name, so the fit is only a shape for this machine."
-            parsed["params_b"] = _shape(system, chosen)["params_b"]
-        if not parsed["quant"]:
+        if parsed.get("params_b") is None:
+            candidates.append(_unsized(name, system, chosen))
+            continue
+        if not parsed.get("quant"):
             parsed["quant"] = {"performance": "Q4_K_M", "balance": "Q5_K_M", "context": "Q4_K_M"}[chosen]
         row = _fit(parsed, system, chosen)
+        row["known_size"] = True
         row["score"] = round(_score(row, chosen), 2)
         candidates.append(row)
-    if candidates:
-        recommendation = max(candidates, key=lambda row: row["score"])
+    shape = _shape(system, chosen)
+    shape["known_size"] = True
+    shape["score"] = round(_score(shape, chosen), 2)
+    known = [row for row in candidates if row.get("known_size")]
+    if known:
+        recommendation = max(known, key=lambda row: row["score"])
     else:
-        recommendation = _shape(system, chosen)
-        recommendation["score"] = round(_score(recommendation, chosen), 2)
-        candidates = [recommendation]
-    where = recommendation["where"]
-    place = {"vram": "GPU memory", "ram": "system RAM", "unknown": "an unknown memory size, so this is only a starting point"}.get(where, where)
-    summary = (
-        f"{chosen}: about {recommendation['params_b']:g}B {recommendation['quant']} "
-        f"at {recommendation['context']} tokens. Weights {recommendation['weight_gb']} GB, "
-        f"KV cache about {recommendation['kv_gb']} GB, {recommendation['used_gb']} GB against {recommendation['budget_gb']} GB of {place}."
-    )
-    if not recommendation["fits"]:
-        summary += " It does not fit. Use a smaller parameter count, a lower quant, or a shorter context."
+        recommendation = dict(shape)
+        recommendation["model"] = ""
+    summary = _summarize(system, chosen, recommendation, candidates, shape)
     return {
         "preset": chosen,
         "local_only": True,
